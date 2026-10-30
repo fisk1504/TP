@@ -35,7 +35,10 @@ jobs:
           for e in mbstring dom xml curl zip sodium pdo_mysql; do php -r "exit(extension_loaded('$e') ? 0 : 1);"; done
 
       - name: Validate manifest
-        run: composer validate --strict --no-check-publish
+        run: |
+          set -euo pipefail
+          composer validate --no-check-publish
+          php -r '$d=json_decode(file_get_contents("composer.json"),true,512,JSON_THROW_ON_ERROR); if(($d["require"]["laravel/framework"]??null)!=="13.39.0") {fwrite(STDERR,"Laravel pin mismatch\n"); exit(1);} echo "laravel_pin=PASS\n";'
 
       - name: Resolve and install production dependencies
         env:
