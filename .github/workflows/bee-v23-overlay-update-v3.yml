@@ -1,0 +1,105 @@
+name: BEE V2.3 overlay update QA v3
+
+on:
+  push:
+    branches: ["bee-v23-build-20261030"]
+    paths:
+      - ".github/workflows/bee-v23-overlay-update-v3.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  overlay-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: bee_overlay
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, dom, xml, curl, zip, sodium, pdo_mysql
+          tools: composer:v2
+          coverage: none
+      - name: Reconstruct sanitized source
+        run: |
+          set -euo pipefail
+          cat transport-r4/00.b64 transport-r5/01a.b64 transport-r5/01b.b64 transport-r4/01.b64 transport-r4/02.b64 transport-r4/03.b64 transport-r5/08a.b64 transport-r5/08b.b64 > source.b64
+          test "$(wc -c < source.b64 | tr -d ' ')" = "71364"
+          base64 -d source.b64 > source.tar.gz
+          echo "78040494f00a7fcf11ec59eb44549015fccb1611df311a6a0a7e657c9b1c4df1  source.tar.gz" | sha256sum -c -
+          mkdir app && tar -xzf source.tar.gz -C app
+          cp r4-overrides/RestoreManager.php app/updater/lib/RestoreManager.php
+          cp r4-overrides/OverlayUpdateManager.php app/updater/lib/OverlayUpdateManager.php
+          cp r4-overrides/CriticalAuth.php app/updater/lib/CriticalAuth.php
+          cp r4-overrides/AuditChainVerifier.php app/app/Services/AuditChainVerifier.php
+      - name: Prepare corrected deterministic harness
+        run: |
+          set -euo pipefail
+          cp r4-overrides/OverlayCycleQa.php /tmp/OverlayCycleQa.php
+          python3 - <<'PY'
+          p='/tmp/OverlayCycleQa.php'
+          s=open(p).read()
+          s=s.replace('APP_KEY=base64:VGhpcy1pcy1hLXFhLWtleS1mb3ItYmVlLXRlc3RzLTIwMjY=', 'APP_KEY=base64:YmVlLXFhLWtleS0zMi1ieXRlcy0yMDI2LWFiY2RlZmc=')
+          marker="file_put_contents($base.'/storage/app/private/install.lock'"
+          injection="$u->forceFill(['mfa_secret'=>$secret,'mfa_recovery_codes'=>[hash('sha256',$recovery)],'mfa_confirmed_at'=>now()])->save();\n"
+          if marker not in s: raise SystemExit('fixture marker not found')
+          s=s.replace(marker,injection+marker,1)
+          open(p,'w').write(s)
+          PY
+          php -l /tmp/OverlayCycleQa.php
+      - name: Download locked production dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: deps-artifact
+          repository: fisk1504/TP
+          run-id: 41014479182
+          github-token: ${{ github.token }}
+      - name: Restore dependencies
+        run: |
+          set -euo pipefail
+          unzip -q deps-artifact/BEE-V2.3-DEPENDENCIES.zip -d deps
+          cp deps/composer.lock app/composer.lock
+          cp -a deps/vendor app/vendor
+          cd app
+          composer check-platform-reqs --no-dev
+          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
+      - name: Execute overlay rollback restore audit cycle
+        working-directory: app
+        run: php /tmp/OverlayCycleQa.php
+      - name: Hash evidence
+        if: success()
+        run: sha256sum evidence-overlay/* > evidence-overlay/SHA256SUMS.txt
+      - name: Upload verified evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-overlay-update-evidence-v3
+          path: evidence-overlay
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-overlay-update-failure-v3
+          path: |
+            app/storage/logs/laravel.log
+            app/storage/app/private/last-overlay-update.json
+          if-no-files-found: warn
+          retention-days: 3
