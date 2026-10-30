@@ -1,0 +1,76 @@
+name: BEE V2.3 dependency build
+
+on:
+  push:
+    branches: ["bee-v23-build-20261030"]
+    paths:
+      - "composer.json"
+      - ".github/workflows/bee-v23-dependencies.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, dom, xml, curl, zip, sodium, pdo_mysql
+          tools: composer:v2
+          coverage: none
+
+      - name: Environment
+        run: |
+          set -euo pipefail
+          php -v
+          composer --version
+          for e in mbstring dom xml curl zip sodium pdo_mysql; do php -r "exit(extension_loaded('$e') ? 0 : 1);"; done
+
+      - name: Validate manifest
+        run: composer validate --strict --no-check-publish
+
+      - name: Resolve and install production dependencies
+        env:
+          COMPOSER_NO_INTERACTION: "1"
+          COMPOSER_PROCESS_TIMEOUT: "900"
+        run: |
+          set -euo pipefail
+          composer update --no-dev --no-scripts --prefer-dist --optimize-autoloader
+          composer check-platform-reqs --no-dev
+          test -f composer.lock
+          test -f vendor/autoload.php
+          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
+
+      - name: Dependency evidence
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          composer show --locked --no-dev --format=json > evidence/composer-show-production.json
+          composer audit --locked --no-dev --format=json > evidence/composer-audit.json || true
+          sha256sum composer.json composer.lock vendor/autoload.php > evidence/SHA256SUMS.txt
+          php -m | sort > evidence/php-modules.txt
+          printf '{"php":"%s","composer":"%s"}\n' "$(php -r 'echo PHP_VERSION;')" "$(composer --version --no-ansi | head -1 | sed 's/"/\\"/g')" > evidence/environment.json
+
+      - name: Package dependencies
+        run: |
+          set -euo pipefail
+          zip -qr BEE-V2.3-DEPENDENCIES.zip composer.lock vendor evidence
+          sha256sum BEE-V2.3-DEPENDENCIES.zip > BEE-V2.3-DEPENDENCIES.zip.sha256
+
+      - name: Upload dependency artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: |
+            BEE-V2.3-DEPENDENCIES.zip
+            BEE-V2.3-DEPENDENCIES.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
