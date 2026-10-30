@@ -187,8 +187,29 @@ jobs:
           DB_USERNAME: root
           DB_PASSWORD: ""
         run: |
+          set +e
+          set -o pipefail
+          ./vendor/bin/phpunit --colors=never 2>&1 | tee /tmp/laravel-tests.txt
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > /tmp/phpunit.rc
+          exit 0
+
+      - name: Upload PHPUnit diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-phpunit-diagnostics
+          path: |
+            /tmp/laravel-tests.txt
+            /tmp/phpunit.rc
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce PHPUnit result
+        run: |
           set -euo pipefail
-          ./vendor/bin/phpunit --colors=never | tee /tmp/laravel-tests.txt
+          test -f /tmp/phpunit.rc
+          test "$(cat /tmp/phpunit.rc)" = "0"
 
       - name: HTTP health and installer lock
         working-directory: app
