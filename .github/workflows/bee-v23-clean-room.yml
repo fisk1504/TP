@@ -6,6 +6,7 @@ on:
     paths:
       - "transport-r4/**"
       - "transport-r5/**"
+      - "r4-overrides/**"
       - ".github/workflows/bee-v23-clean-room.yml"
   workflow_dispatch:
 
@@ -64,6 +65,12 @@ jobs:
           test ! -f app/.env
           test ! -f app/INSTALL-CODE.txt
           test ! -f app/storage/app/private/install.authorization
+          test "$(sha256sum r4-overrides/composer.json | awk '{print $1}')" = "3302ad9dbac3ab5affa604dc10854ee3354fe12bc2190898b3ffcc9456b47c7c"
+          test "$(sha256sum r4-overrides/AnalyticsDisabledTest.php | awk '{print $1}')" = "33b44a50b7059dc6199b64df4192e7b7cb30fdf0435a8834604292fe4167552a"
+          test "$(sha256sum r4-overrides/ApiAuthTest.php | awk '{print $1}')" = "da6a3b20b423164ade340f46c97ef609d699edc5ed91a6d2b402b4d0fbdb8438"
+          cp r4-overrides/composer.json app/composer.json
+          cp r4-overrides/AnalyticsDisabledTest.php app/tests/Feature/AnalyticsDisabledTest.php
+          cp r4-overrides/ApiAuthTest.php app/tests/Feature/ApiAuthTest.php
           mkdir -p app/storage/app/private app/storage/framework/cache app/storage/framework/sessions app/storage/framework/views app/storage/logs app/bootstrap/cache
           chmod -R u+rwX app/storage app/bootstrap/cache
 
@@ -74,7 +81,7 @@ jobs:
           path: deps-artifact
           github-token: ${{ github.token }}
           repository: fisk1504/TP
-          run-id: 41002385749
+          run-id: 41014479182
 
       - name: Restore locked production dependencies
         run: |
@@ -189,6 +196,9 @@ jobs:
         run: |
           set +e
           set -o pipefail
+          php artisan migrate:fresh --force 2>&1 | tee /tmp/test-migrations.txt
+          migrate_rc=${PIPESTATUS[0]}
+          if [ "$migrate_rc" != "0" ]; then echo "$migrate_rc" > /tmp/phpunit.rc; exit 0; fi
           ./vendor/bin/phpunit --colors=never 2>&1 | tee /tmp/laravel-tests.txt
           rc=${PIPESTATUS[0]}
           echo "$rc" > /tmp/phpunit.rc
@@ -202,6 +212,7 @@ jobs:
           path: |
             /tmp/laravel-tests.txt
             /tmp/phpunit.rc
+            /tmp/test-migrations.txt
           if-no-files-found: warn
           retention-days: 7
 
@@ -245,12 +256,14 @@ jobs:
           cp /tmp/db-assertions.json /tmp/evidence/
           cp /tmp/migrate-status.txt /tmp/evidence/
           cp /tmp/laravel-tests.txt /tmp/evidence/
+          cp /tmp/test-migrations.txt /tmp/evidence/
           cp /tmp/full-install-preinstall.json /tmp/evidence/
           cp /tmp/full-install-gate.json /tmp/evidence/
           cp /tmp/up.txt /tmp/evidence/
           cp /tmp/install-body.txt /tmp/evidence/
           cp /tmp/bee-http.log /tmp/evidence/
           printf '%s\n' '78040494f00a7fcf11ec59eb44549015fccb1611df311a6a0a7e657c9b1c4df1  sanitized-source' > /tmp/evidence/source-sha256.txt
+          printf '%s\n' '3302ad9dbac3ab5affa604dc10854ee3354fe12bc2190898b3ffcc9456b47c7c  composer.json' '33b44a50b7059dc6199b64df4192e7b7cb30fdf0435a8834604292fe4167552a  AnalyticsDisabledTest.php' 'da6a3b20b423164ade340f46c97ef609d699edc5ed91a6d2b402b4d0fbdb8438  ApiAuthTest.php' > /tmp/evidence/r4-overrides-sha256.txt
           php -r '$r=["status"=>"PASS","php"=>PHP_VERSION,"release"=>"2.3.0","schema"=>4,"mysql_clean_room"=>true,"installer"=>true,"tenant_isolation_tests"=>true,"installer_lock_http"=>true,"production_dependency_shape"=>true,"generated_at"=>gmdate("c")]; file_put_contents("/tmp/evidence/clean-room-report.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
           sha256sum /tmp/evidence/* > /tmp/evidence/SHA256SUMS.txt
 
