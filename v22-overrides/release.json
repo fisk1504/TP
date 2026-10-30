@@ -1,0 +1,21 @@
+{
+    "version": "2.2.0",
+    "schema_version": 3,
+    "release_id": "BEE-AIO-20261030-005",
+    "built_at": "2026-10-30T02:36:29Z",
+    "min_php": "8.4.0",
+    "min_database": "MySQL 8.0 / MariaDB 10.6",
+    "manifest_sha256": "8c65cdb012a3a2149bf00bd5472b0de90095785054ca0b1ea1027ec201ef0fef",
+    "signature_algorithm": "Ed25519",
+    "update_trust_version": 1,
+    "update_signature_key_id": "bee-release-2026q4-v1",
+    "compatible_from_versions": [
+        "2.1.0",
+        "2.1.999"
+    ],
+    "migration_range": {
+        "from_schema": 2,
+        "to_schema": 3
+    },
+    "package_type": "full"
+}
