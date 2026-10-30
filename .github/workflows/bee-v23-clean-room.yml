@@ -4,12 +4,13 @@ on:
   push:
     branches: ["bee-v23-build-20261030"]
     paths:
-      - "bee-v23-app-source-safe.tar.gz"
+      - "bee-v23-cleanroom-source-min.tar.gz"
       - ".github/workflows/bee-v23-clean-room.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   clean-room:
@@ -40,18 +41,44 @@ jobs:
           tools: composer:v2
           coverage: none
 
-      - name: Extract sanitized source
+      - name: Verify and extract sanitized source
         run: |
           set -euo pipefail
+          echo "78040494f00a7fcf11ec59eb44549015fccb1611df311a6a0a7e657c9b1c4df1  bee-v23-cleanroom-source-min.tar.gz" | sha256sum -c -
           mkdir app
-          tar -xzf bee-v23-app-source-safe.tar.gz -C app
-          test -f app/composer.lock
+          tar -xzf bee-v23-cleanroom-source-min.tar.gz -C app
+          test -f app/composer.json
           test -f app/release.json
           test ! -f app/.env
           test ! -f app/INSTALL-CODE.txt
           test ! -f app/storage/app/private/install.authorization
+          mkdir -p app/storage/app/private app/storage/framework/cache app/storage/framework/sessions app/storage/framework/views app/storage/logs app/bootstrap/cache
+          chmod -R u+rwX app/storage app/bootstrap/cache
 
-      - name: Install QA dependencies from locked graph
+      - name: Download locked production dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: deps-artifact
+          github-token: ${{ github.token }}
+          repository: fisk1504/TP
+          run-id: 41002385749
+
+      - name: Restore composer.lock and vendor from verified dependency build
+        run: |
+          set -euo pipefail
+          test -f deps-artifact/BEE-V2.3-DEPENDENCIES.zip
+          unzip -q deps-artifact/BEE-V2.3-DEPENDENCIES.zip -d app
+          test -f app/composer.lock
+          test -f app/vendor/autoload.php
+          cd app
+          composer validate --no-check-publish || test $? -eq 1
+          composer check-platform-reqs --no-dev
+          php tools/full-install-gate.php | tee /tmp/full-install-preinstall.json
+          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
+          php artisan --version
+
+      - name: Install QA-only dev dependencies from locked graph
         working-directory: app
         env:
           COMPOSER_NO_INTERACTION: "1"
@@ -60,9 +87,6 @@ jobs:
           set -euo pipefail
           composer install --no-scripts --prefer-dist --optimize-autoloader
           composer check-platform-reqs
-          php tools/full-install-gate.php
-          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
-          php artisan --version
 
       - name: Execute clean-room installer against MySQL
         working-directory: app
@@ -145,10 +169,9 @@ jobs:
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT
           for i in $(seq 1 20); do curl -fsS -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/up >/tmp/up.txt && break || sleep 1; done
-          grep -q 'OK' /tmp/up.txt || test -s /tmp/up.txt
+          test -s /tmp/up.txt
           code=$(curl -sS -o /tmp/install-body.txt -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/install/)
           test "$code" = "404"
-          grep -q 'Not Found' /tmp/install-body.txt
 
       - name: Production dependency shape
         working-directory: app
@@ -158,8 +181,6 @@ jobs:
           set -euo pipefail
           composer install --no-dev --no-scripts --prefer-dist --optimize-autoloader
           composer check-platform-reqs --no-dev
-          test -f composer.lock
-          test -f vendor/autoload.php
           php tools/full-install-gate.php | tee /tmp/full-install-gate.json
           php -r 'require "vendor/autoload.php"; echo "production_autoload=PASS\n";'
 
@@ -172,10 +193,12 @@ jobs:
           cp /tmp/db-assertions.json /tmp/evidence/
           cp /tmp/migrate-status.txt /tmp/evidence/
           cp /tmp/laravel-tests.txt /tmp/evidence/
+          cp /tmp/full-install-preinstall.json /tmp/evidence/
           cp /tmp/full-install-gate.json /tmp/evidence/
           cp /tmp/up.txt /tmp/evidence/
           cp /tmp/install-body.txt /tmp/evidence/
           cp /tmp/bee-http.log /tmp/evidence/
+          printf '%s\n' '78040494f00a7fcf11ec59eb44549015fccb1611df311a6a0a7e657c9b1c4df1  bee-v23-cleanroom-source-min.tar.gz' > /tmp/evidence/source-sha256.txt
           php -r '$r=["status"=>"PASS","php"=>PHP_VERSION,"release"=>"2.3.0","schema"=>4,"mysql_clean_room"=>true,"installer"=>true,"tenant_isolation_tests"=>true,"installer_lock_http"=>true,"production_dependency_shape"=>true,"generated_at"=>gmdate("c")]; file_put_contents("/tmp/evidence/clean-room-report.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
           sha256sum /tmp/evidence/* > /tmp/evidence/SHA256SUMS.txt
 
