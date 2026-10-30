@@ -1,0 +1,138 @@
+name: BEE V2.3 final security QA
+
+on:
+  push:
+    branches: ["bee-v23-build-20261030"]
+    paths:
+      - ".github/workflows/bee-v23-security-final.yml"
+      - "r4-overrides/SecurityHardeningTest.php"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: bee_security
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, dom, xml, curl, zip, sodium, pdo_mysql
+          tools: composer:v2
+          coverage: none
+      - name: Build QA application
+        run: |
+          set -euo pipefail
+          cat transport-r4/00.b64 transport-r5/01a.b64 transport-r5/01b.b64 transport-r4/01.b64 transport-r4/02.b64 transport-r4/03.b64 transport-r5/08a.b64 transport-r5/08b.b64 > source.b64
+          test "$(wc -c < source.b64 | tr -d ' ')" = "71364"
+          base64 -d source.b64 > source.tar.gz
+          echo "78040494f00a7fcf11ec59eb44549015fccb1611df311a6a0a7e657c9b1c4df1  source.tar.gz" | sha256sum -c -
+          mkdir app && tar -xzf source.tar.gz -C app
+          cp r4-overrides/composer.json app/composer.json
+          cp r4-overrides/SecurityHardeningTest.php app/tests/Feature/SecurityHardeningTest.php
+          cp r4-overrides/CriticalAuth.php app/updater/lib/CriticalAuth.php
+      - name: Download locked dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: deps-artifact
+          repository: fisk1504/TP
+          run-id: 41014479182
+          github-token: ${{ github.token }}
+      - name: Install QA dependencies from locked graph
+        run: |
+          set -euo pipefail
+          unzip -q deps-artifact/BEE-V2.3-DEPENDENCIES.zip -d app
+          cd app
+          composer install --no-scripts --prefer-dist --optimize-autoloader
+          composer check-platform-reqs
+          test -x vendor/bin/phpunit
+      - name: Configure MySQL and secure session
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cat > .env <<'ENV'
+          APP_NAME=BEE
+          APP_ENV=testing
+          APP_KEY=base64:YmVlLXFhLWtleS0zMi1ieXRlcy0yMDI2LWFiY2RlZmc=
+          APP_DEBUG=false
+          APP_URL=https://acesso.busqueencontreempresas.com.br
+          DB_CONNECTION=mysql
+          DB_HOST=127.0.0.1
+          DB_PORT=3306
+          DB_DATABASE=bee_security
+          DB_USERNAME=root
+          DB_PASSWORD=
+          CACHE_STORE=database
+          SESSION_DRIVER=database
+          SESSION_DOMAIN=
+          SESSION_SECURE_COOKIE=true
+          SESSION_HTTP_ONLY=true
+          SESSION_SAME_SITE=strict
+          BEE_REQUIRE_ADMIN_MFA=true
+          BEE_FIREWALL_ENABLED=true
+          BEE_TRUSTED_PROXIES=
+          BEE_PANEL_DOMAIN=acesso.busqueencontreempresas.com.br
+          BEE_API_DOMAIN=api.busqueencontreempresas.com.br
+          BEE_ANALYTICS_DOMAIN=analytics.busqueencontreempresas.com.br
+          ENV
+          mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+          php artisan migrate:fresh --force
+      - name: Feature security tests
+        working-directory: app
+        run: |
+          set -euo pipefail
+          ./vendor/bin/phpunit --colors=never tests/Feature/SecurityHardeningTest.php | tee /tmp/security-phpunit.txt
+      - name: Live HTTP CSRF cookie and protected-path tests
+        working-directory: app
+        run: |
+          set -euo pipefail
+          php artisan serve --host=127.0.0.1 --port=8090 >/tmp/bee-security-server.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do curl -fsS -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8090/up >/dev/null && break; sleep 1; done
+          curl -sS -D /tmp/login.headers -o /tmp/login.body -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8090/login
+          grep -qi '^HTTP/.* 200' /tmp/login.headers
+          grep -qi 'set-cookie:.*Secure' /tmp/login.headers
+          grep -qi 'set-cookie:.*HttpOnly' /tmp/login.headers
+          grep -qi 'set-cookie:.*SameSite=Strict' /tmp/login.headers
+          if grep -qi 'Domain=' /tmp/login.headers; then echo 'Session cookie must be host-only'; exit 1; fi
+          code=$(curl -sS -o /tmp/csrf.body -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' -H 'Content-Type: application/x-www-form-urlencoded' --data 'email=x%40example.test&password=x' http://127.0.0.1:8090/login)
+          test "$code" = "419"
+          for p in '/.env' '/composer.json' '/storage/app/private/install.lock' '/vendor/autoload.php'; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' "http://127.0.0.1:8090$p")
+            test "$code" = "404"
+          done
+          cp /tmp/login.headers /tmp/csrf.body /tmp/bee-security-server.log /tmp/
+      - name: Produce security evidence
+        run: |
+          set -euo pipefail
+          mkdir evidence-security
+          cp /tmp/security-phpunit.txt evidence-security/
+          cp /tmp/login.headers evidence-security/
+          cp /tmp/csrf.body evidence-security/
+          php -r '$r=["status"=>"PASS","feature_security"=>true,"firewall_4_to_429"=>true,"untrusted_xff_ignored"=>true,"session_timeout"=>true,"reauth"=>true,"cookie_host_only_secure_httponly_strict"=>true,"csrf_419"=>true,"security_headers_https"=>true,"protected_paths"=>true,"generated_at"=>gmdate("c")];file_put_contents("evidence-security/security-report.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
+          sha256sum evidence-security/* > evidence-security/SHA256SUMS.txt
+      - name: Upload security evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-security-final-evidence
+          path: evidence-security
+          if-no-files-found: error
+          retention-days: 7
