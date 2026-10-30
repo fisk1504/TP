@@ -1,0 +1,188 @@
+name: BEE V2.3 clean-room QA
+
+on:
+  push:
+    branches: ["bee-v23-build-20261030"]
+    paths:
+      - "bee-v23-app-source-safe.tar.gz"
+      - ".github/workflows/bee-v23-clean-room.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clean-room:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: bee_cleanroom
+          MYSQL_ROOT_PASSWORD: bee_root_pw
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -prootpw"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, dom, xml, curl, zip, sodium, pdo_mysql
+          tools: composer:v2
+          coverage: none
+
+      - name: Extract sanitized source
+        run: |
+          set -euo pipefail
+          mkdir app
+          tar -xzf bee-v23-app-source-safe.tar.gz -C app
+          test -f app/composer.lock
+          test -f app/release.json
+          test ! -f app/.env
+          test ! -f app/INSTALL-CODE.txt
+          test ! -f app/storage/app/private/install.authorization
+
+      - name: Install QA dependencies from locked graph
+        working-directory: app
+        env:
+          COMPOSER_NO_INTERACTION: "1"
+          COMPOSER_PROCESS_TIMEOUT: "900"
+        run: |
+          set -euo pipefail
+          composer install --no-scripts --prefer-dist --optimize-autoloader
+          composer check-platform-reqs
+          php tools/full-install-gate.php
+          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
+          php artisan --version
+
+      - name: Execute clean-room installer against MySQL
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cat > /tmp/bee-cleanroom-install.php <<'PHP'
+          <?php
+          declare(strict_types=1);
+          $base=getcwd();
+          $_SERVER['DOCUMENT_ROOT']=$base.'/public';
+          $_SERVER['HTTPS']='on';
+          foreach(['Common','CommandRunner','DependencyBootstrap','InstallerState','EnvironmentProbe','CpanelProvisioner','EnvWriter','DatabaseProvisioner','Totp','TrustBootstrap','InstallThrottle','InstallRunner'] as $f) require_once $base.'/installer/lib/'.$f.'.php';
+          $result=(new BeeInstaller\InstallRunner())->install([
+              'panel_domain'=>'acesso.busqueencontreempresas.com.br',
+              'api_domain'=>'api.busqueencontreempresas.com.br',
+              'analytics_domain'=>'analytics.busqueencontreempresas.com.br',
+              'db'=>['host'=>'127.0.0.1','port'=>3306,'database'=>'bee_cleanroom','username'=>'root','password'=>'bee_root_pw'],
+              'admin'=>['name'=>'Clean Room Owner','email'=>'owner@cleanroom.invalid','password'=>'CleanRoom-2026-Strong!','password_confirmation'=>'CleanRoom-2026-Strong!'],
+              'mfa_required'=>true,
+              'cpanel_mode'=>'assisted',
+          ]);
+          echo json_encode(['installed'=>true,'mfa_required'=>$result['mfa_required']??null,'trust_store_version'=>$result['update_trust']['trust_store_version']??null],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
+          PHP
+          php /tmp/bee-cleanroom-install.php | tee /tmp/install-result.json
+          test -f .env
+          test -f storage/app/private/install.lock
+          test -f storage/app/private/installed-release.json
+          test ! -f storage/app/private/install.authorization
+          test ! -f INSTALL-CODE.txt
+          grep -q 'BEE_SCHEMA_VERSION="4"' .env
+          grep -q 'BEE_REQUIRE_ADMIN_MFA="true"' .env
+
+      - name: Database and release assertions
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cat > /tmp/bee-db-assert.php <<'PHP'
+          <?php
+          declare(strict_types=1);
+          $pdo=new PDO('mysql:host=127.0.0.1;port=3306;dbname=bee_cleanroom;charset=utf8mb4','root','bee_root_pw',[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+          $checks=[];
+          $checks['owner']=(int)$pdo->query("SELECT COUNT(*) FROM users u JOIN roles r ON r.id=u.platform_role_id WHERE u.email='owner@cleanroom.invalid' AND u.status='ACTIVE' AND r.name='PLATFORM_OWNER'")->fetchColumn()===1;
+          $checks['cooper']=(int)$pdo->query("SELECT COUNT(*) FROM tenants WHERE slug='cooperfibra' AND status='ACTIVE'")->fetchColumn()===1;
+          $row=$pdo->query("SELECT version,schema_version,release_id,trust_store_version FROM platform_versions ORDER BY id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+          $checks['version']=($row['version']??null)==='2.3.0';
+          $checks['schema']=(int)($row['schema_version']??0)===4;
+          $checks['release']=($row['release_id']??null)==='BEE-AIO-20261030-006';
+          $checks['trust']=(int)($row['trust_store_version']??0)>=1;
+          $hash=$pdo->query("SELECT password FROM users WHERE email='owner@cleanroom.invalid' LIMIT 1")->fetchColumn();
+          $checks['password_hash']=is_string($hash) && password_verify('CleanRoom-2026-Strong!',$hash);
+          foreach($checks as $k=>$ok){ if(!$ok){fwrite(STDERR,"FAIL:$k\n"); exit(1);} }
+          echo json_encode(['ok'=>true,'checks'=>$checks,'platform_version'=>$row],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
+          PHP
+          php /tmp/bee-db-assert.php | tee /tmp/db-assertions.json
+          php artisan migrate:status > /tmp/migrate-status.txt
+
+      - name: Create isolated test database
+        run: |
+          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;charset=utf8mb4","root","bee_root_pw",[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]); $p->exec("DROP DATABASE IF EXISTS bee_tests"); $p->exec("CREATE DATABASE bee_tests CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");'
+
+      - name: Laravel feature tests on separate DB
+        working-directory: app
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: bee_tests
+          DB_USERNAME: root
+          DB_PASSWORD: bee_root_pw
+        run: |
+          set -euo pipefail
+          php artisan test --colors=never | tee /tmp/laravel-tests.txt
+
+      - name: HTTP health and installer lock
+        working-directory: app
+        run: |
+          set -euo pipefail
+          php artisan serve --host=127.0.0.1 --port=8080 >/tmp/bee-http.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do curl -fsS -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/up >/tmp/up.txt && break || sleep 1; done
+          grep -q 'OK' /tmp/up.txt || test -s /tmp/up.txt
+          code=$(curl -sS -o /tmp/install-body.txt -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/install/)
+          test "$code" = "404"
+          grep -q 'Not Found' /tmp/install-body.txt
+
+      - name: Production dependency shape
+        working-directory: app
+        env:
+          COMPOSER_NO_INTERACTION: "1"
+        run: |
+          set -euo pipefail
+          composer install --no-dev --no-scripts --prefer-dist --optimize-autoloader
+          composer check-platform-reqs --no-dev
+          test -f composer.lock
+          test -f vendor/autoload.php
+          php tools/full-install-gate.php | tee /tmp/full-install-gate.json
+          php -r 'require "vendor/autoload.php"; echo "production_autoload=PASS\n";'
+
+      - name: Produce QA evidence
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/evidence
+          cp /tmp/install-result.json /tmp/evidence/
+          cp /tmp/db-assertions.json /tmp/evidence/
+          cp /tmp/migrate-status.txt /tmp/evidence/
+          cp /tmp/laravel-tests.txt /tmp/evidence/
+          cp /tmp/full-install-gate.json /tmp/evidence/
+          cp /tmp/up.txt /tmp/evidence/
+          cp /tmp/install-body.txt /tmp/evidence/
+          cp /tmp/bee-http.log /tmp/evidence/
+          php -r '$r=["status"=>"PASS","php"=>PHP_VERSION,"release"=>"2.3.0","schema"=>4,"mysql_clean_room"=>true,"installer"=>true,"tenant_isolation_tests"=>true,"installer_lock_http"=>true,"production_dependency_shape"=>true,"generated_at"=>gmdate("c")]; file_put_contents("/tmp/evidence/clean-room-report.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
+          sha256sum /tmp/evidence/* > /tmp/evidence/SHA256SUMS.txt
+
+      - name: Upload clean-room evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v23-clean-room-evidence
+          path: /tmp/evidence
+          if-no-files-found: error
+          retention-days: 7
