@@ -1,0 +1,198 @@
+name: BEE V2.6 transactional update rollback QA
+
+on:
+  push:
+    branches: ["bee-v26-runtime-qa-20261031"]
+    paths:
+      - ".github/workflows/bee-v26-update-rollback.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  update-rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: bee_update
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, dom, xml, curl, zip, sodium, pdo_mysql
+          coverage: none
+
+      - name: Reconstruct exact V2.6 source
+        run: |
+          set -euo pipefail
+          cat v26-runtime-r3/00.b64 v26-runtime-r3/01.b64 v26-runtime-r3/02.b64 v26-runtime-r3/03.b64 v26-runtime-r3/04.b64 v26-runtime-r3/05a.b64 v26-runtime-r3/05b.b64 v26-runtime-r3/06.b64 v26-runtime-r3/07.b64 v26-runtime-r3/08.b64 v26-runtime-r3/09.b64 | tr -d '\r\n' | base64 -d > /tmp/source.tar.gz
+          echo '41df29392f8b994ebe7f49f129bc5110f509ef8721bfcac6807a5f66beddca5f  /tmp/source.tar.gz' | sha256sum -c -
+          mkdir app && tar -xzf /tmp/source.tar.gz -C app
+          mkdir -p app/storage/app/private app/storage/framework/{cache,sessions,views} app/storage/logs app/bootstrap/cache
+          chmod -R u+rwX app/storage app/bootstrap/cache
+
+      - name: Download production vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: deps
+          github-token: ${{ github.token }}
+          repository: fisk1504/TP
+          run-id: 41014479182
+
+      - name: Restore vendor preserving V2.6 lock
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/proddeps && mkdir /tmp/proddeps
+          unzip -q ../deps/BEE-V2.3-DEPENDENCIES.zip -d /tmp/proddeps
+          cp -a /tmp/proddeps/vendor ./vendor
+          echo 'b69c2fa1196d301f8af8d3d3a31264c437b07dcaab554f90badd2b5704088bab  composer.lock' | sha256sum -c -
+
+      - name: Install V2.6 clean database
+        working-directory: app
+        run: |
+          set -euo pipefail
+          php -r 'file_put_contents("/tmp/update-pass",bin2hex(random_bytes(18))."Aa!");'
+          cat >/tmp/install.php <<'PHP'
+          <?php
+          $base=getcwd();$pw=trim(file_get_contents('/tmp/update-pass'));$_SERVER['DOCUMENT_ROOT']=$base.'/public';$_SERVER['HTTPS']='on';
+          foreach(['Common','CommandRunner','DependencyBootstrap','InstallerState','EnvironmentProbe','CpanelProvisioner','EnvWriter','DatabaseProvisioner','Totp','TrustBootstrap','InstallThrottle','FleetTenantProvisioner','InstallRunner'] as $f) require_once $base.'/installer/lib/'.$f.'.php';
+          (new BeeInstaller\InstallRunner())->install(['panel_domain'=>'acesso.busqueencontreempresas.com.br','api_domain'=>'api.busqueencontreempresas.com.br','analytics_domain'=>'analytics.busqueencontreempresas.com.br','db'=>['host'=>'127.0.0.1','port'=>3306,'database'=>'bee_update','username'=>'root','password'=>''],'admin'=>['name'=>'Update Owner','email'=>'update-owner@v26.invalid','password'=>$pw,'password_confirmation'=>$pw],'mfa_required'=>true,'cpanel_mode'=>'assisted','register_published_tenants'=>true]);
+          PHP
+          php /tmp/install.php
+
+      - name: Build canonical signed V2.6 update ZIP from target manifest
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cat >/tmp/build-update.php <<'PHP'
+          <?php
+          $base=getcwd();$dir=$base.'/resources/update-baselines/v2.5.0';$m=json_decode(file_get_contents($dir.'/target-manifest.json'),true);
+          function pathsFrom($m){
+            $c=$m['files']??$m['payload']??$m['entries']??[];$out=[];
+            if(is_array($c)) foreach($c as $k=>$v){
+              if(is_string($k) && !is_int($k)) $out[]=$k;
+              elseif(is_string($v)) $out[]=$v;
+              elseif(is_array($v) && isset($v['path'])) $out[]=$v['path'];
+              elseif(is_array($v) && isset($v['file'])) $out[]=$v['file'];
+            }
+            return array_values(array_unique(array_filter($out)));
+          }
+          $paths=pathsFrom($m); if(!$paths) throw new RuntimeException('No target paths');
+          $z=new ZipArchive(); if($z->open('/tmp/v26-update.zip',ZipArchive::CREATE|ZipArchive::OVERWRITE)!==true) throw new RuntimeException('zip');
+          foreach($paths as $p){$p=ltrim(str_replace('\\','/',$p),'/');$f=$base.'/'.$p;if(!is_file($f))throw new RuntimeException('Missing target '.$p);$z->addFile($f,$p);}
+          $z->addFile($dir.'/target-manifest.json','target-manifest.json');$z->addFile($dir.'/target-manifest.sig','target-manifest.sig');$z->close();
+          file_put_contents('/tmp/target-paths.json',json_encode($paths,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+          echo 'target_paths='.count($paths),"\n";
+          PHP
+          php /tmp/build-update.php
+          test -s /tmp/v26-update.zip
+
+      - name: Prepare deterministic V2.5 downgrade helper
+        working-directory: app
+        run: |
+          cat >/tmp/downgrade.php <<'PHP'
+          <?php
+          declare(strict_types=1);
+          $base=getcwd();$dir=$base.'/resources/update-baselines/v2.5.0';$paths=json_decode(file_get_contents('/tmp/target-paths.json'),true);
+          $rz=new ZipArchive();if($rz->open($dir.'/rollback-files.zip')!==true)throw new RuntimeException('rollback zip');$old=[];
+          for($i=0;$i<$rz->numFiles;$i++){$n=$rz->getNameIndex($i);if($n!==false&&!str_ends_with($n,'/'))$old[]=ltrim(str_replace('\\','/',$n),'/');}
+          $rz->extractTo($base);$rz->close();
+          $oldMap=array_fill_keys($old,true);$new=[];
+          foreach($paths as $p){$p=ltrim(str_replace('\\','/',$p),'/');if(!isset($oldMap[$p])){$new[]=$p;$f=$base.'/'.$p;if(is_file($f)||is_link($f))@unlink($f);}}
+          usort($new,fn($a,$b)=>substr_count($b,'/')<=>substr_count($a,'/'));foreach($new as $p){$d=dirname($base.'/'.$p);while($d!==$base&&str_starts_with($d,$base)){if(is_dir($d)&&count(scandir($d))===2)@rmdir($d);$d=dirname($d);}}
+          $rel=json_decode(file_get_contents($base.'/release.json'),true);$ver=(string)($rel['version']??'2.5.0');$schema=(int)($rel['schema_version']??$rel['schema']??4);$rid=(string)($rel['release_id']??$rel['id']??'');
+          $ip=$base.'/storage/app/private/installed-release.json';$inst=is_file($ip)?json_decode(file_get_contents($ip),true):[];
+          foreach(['version','installed_version','release_version'] as $k)if(array_key_exists($k,$inst))$inst[$k]=$ver;
+          foreach(['schema','schema_version'] as $k)if(array_key_exists($k,$inst))$inst[$k]=$schema;
+          foreach(['release_id','id'] as $k)if(array_key_exists($k,$inst))$inst[$k]=$rid;
+          $inst['version']=$ver;$inst['schema_version']=$schema;$inst['release_id']=$rid;file_put_contents($ip,json_encode($inst,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES)."\n");
+          $env=file_get_contents($base.'/.env');$repl=['BEE_RELEASE_VERSION'=> $ver,'BEE_SCHEMA_VERSION'=>(string)$schema,'BEE_RELEASE_ID'=>$rid];foreach($repl as $k=>$v){$q=$k.'="'.addcslashes($v,"\\\"").'"';$env=preg_match('/^'.preg_quote($k,'/').'=.*/m',$env)?preg_replace('/^'.preg_quote($k,'/').'=.*/m',$q,$env):$env."\n$q";}file_put_contents($base.'/.env',$env);
+          $p=new PDO('mysql:host=127.0.0.1;port=3306;dbname=bee_update;charset=utf8mb4','root','',[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);$row=$p->query('SELECT id FROM platform_versions ORDER BY id DESC LIMIT 1')->fetchColumn();$st=$p->prepare('UPDATE platform_versions SET version=?,schema_version=?,release_id=? WHERE id=?');$st->execute([$ver,$schema,$rid,$row]);
+          $hashes=[];foreach($old as $p0){$f=$base.'/'.$p0;if(is_file($f))$hashes[$p0]=hash_file('sha256',$f);}file_put_contents('/tmp/v25-state.json',json_encode(['version'=>$ver,'schema'=>$schema,'release_id'=>$rid,'old_files'=>$hashes,'new_files'=>$new],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+          echo json_encode(['status'=>'V25_READY','version'=>$ver,'release_id'=>$rid,'old_count'=>count($old),'new_count'=>count($new)]),"\n";
+          PHP
+
+      - name: Successful transactional V2.5 to V2.6 apply
+        id: update
+        working-directory: app
+        run: |
+          set -euo pipefail
+          php /tmp/downgrade.php | tee /tmp/downgrade-success.json
+          cat >/tmp/apply.php <<'PHP'
+          <?php
+          require 'vendor/autoload.php';foreach(glob(getcwd().'/updater/lib/*.php') as $f)require_once $f;
+          $classes=['BeeUpdater\\OverlayUpdateManager','BEE\\Updater\\OverlayUpdateManager','OverlayUpdateManager'];$c=null;foreach($classes as $x)if(class_exists($x)){$c=$x;break;}if(!$c)throw new RuntimeException('OverlayUpdateManager class not found');
+          $r=(new $c())->apply('/tmp/v26-update.zip');echo json_encode(['status'=>'PASS','result'=>$r],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
+          PHP
+          php /tmp/apply.php | tee /tmp/update-success.json
+          php -r '$r=json_decode(file_get_contents("release.json"),true);if(($r["version"]??null)!=="2.6.0")exit(1);$i=json_decode(file_get_contents("storage/app/private/installed-release.json"),true);if(($i["version"]??null)!=="2.6.0")exit(2);$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_update;charset=utf8mb4","root","");if($p->query("SELECT version FROM platform_versions ORDER BY id DESC LIMIT 1")->fetchColumn()!=="2.6.0")exit(3);echo "activation=PASS\n";' | tee /tmp/update-activation.txt
+          php -r '$m=json_decode(file_get_contents("resources/update-baselines/v2.5.0/target-manifest.json"),true);$c=$m["files"]??$m["payload"]??$m["entries"]??[];$bad=[];foreach($c as $k=>$v){$p=is_string($k)&&!is_int($k)?$k:(is_array($v)?($v["path"]??$v["file"]??null):$v);$h=is_string($k)&&!is_int($k)?(is_string($v)?$v:($v["sha256"]??$v["hash"]??null)):(is_array($v)?($v["sha256"]??$v["hash"]??null):null);if($p&&$h&&(!is_file($p)||hash_file("sha256",$p)!==$h))$bad[]=$p;}if($bad){fwrite(STDERR,json_encode($bad));exit(1);}echo "target_hashes=PASS\n";' | tee /tmp/update-hashes.txt
+
+      - name: Forced postflight failure and automatic rollback
+        id: rollback
+        working-directory: app
+        run: |
+          set -euo pipefail
+          php /tmp/downgrade.php | tee /tmp/downgrade-fail.json
+          cat >/tmp/forced.php <<'PHP'
+          <?php
+          require 'vendor/autoload.php';foreach(glob(getcwd().'/updater/lib/*.php') as $f)require_once $f;
+          $src='';foreach(glob(getcwd().'/updater/lib/*.php') as $f)$src.=file_get_contents($f)."\n";
+          preg_match_all('/BEE_[A-Z0-9_]*(?:PROBE|POSTFLIGHT|FORCE)[A-Z0-9_]*/',$src,$mm);foreach(array_unique($mm[0]??[]) as $k){putenv($k.'=/bin/false');$_ENV[$k]='/bin/false';$_SERVER[$k]='/bin/false';}
+          $classes=['BeeUpdater\\OverlayUpdateManager','BEE\\Updater\\OverlayUpdateManager','OverlayUpdateManager'];$c=null;foreach($classes as $x)if(class_exists($x)){$c=$x;break;}if(!$c)throw new RuntimeException('class');$mgr=new $c();
+          $rc=new ReflectionClass($mgr);foreach($rc->getProperties() as $p){$n=strtolower($p->getName());if(str_contains($n,'probe')){try{$p->setAccessible(true);$p->setValue($mgr,static function(){return false;});}catch(Throwable $e){}}}
+          $failed=false;try{$r=$mgr->apply('/tmp/v26-update.zip');if(is_array($r)&&(($r['status']??'')==='FAILED'||($r['ok']??true)===false))$failed=true;}catch(Throwable $e){$failed=true;file_put_contents('/tmp/forced-error.txt',get_class($e).': '.$e->getMessage());}
+          if(!$failed){fwrite(STDERR,"Forced failure did not fail\n");exit(20);}echo "forced_failure=PASS\n";
+          PHP
+          php /tmp/forced.php | tee /tmp/forced.txt
+          php -r '$pre=json_decode(file_get_contents("/tmp/v25-state.json"),true);$r=json_decode(file_get_contents("release.json"),true);if(($r["version"]??null)!==$pre["version"])exit(1);$i=json_decode(file_get_contents("storage/app/private/installed-release.json"),true);if(($i["version"]??null)!==$pre["version"])exit(2);foreach($pre["old_files"] as $f=>$h)if(!is_file($f)||hash_file("sha256",$f)!==$h){fwrite(STDERR,"old mismatch:$f\n");exit(3);}foreach($pre["new_files"] as $f)if(is_file($f)){fwrite(STDERR,"new remains:$f\n");exit(4);}$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_update;charset=utf8mb4","root","");if($p->query("SELECT version FROM platform_versions ORDER BY id DESC LIMIT 1")->fetchColumn()!==$pre["version"])exit(5);echo "rollback_files_db_metadata=PASS\n";' | tee /tmp/rollback-assert.txt
+
+      - name: Publish sanitized update status
+        if: always()
+        env:
+          UPDATE_OUTCOME: ${{ steps.update.outcome }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+        run: |
+          mkdir -p v26-update-result
+          python3 - <<'PY'
+          import json,os
+          d={'release':'2.6.0','update':os.environ.get('UPDATE_OUTCOME','unknown'),'rollback':os.environ.get('ROLLBACK_OUTCOME','unknown')}
+          d['all_update_pass']=d['update']=='success' and d['rollback']=='success'
+          open('v26-update-result/update-status.json','w').write(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name bee-qa-bot
+          git config user.email bee-qa-bot@users.noreply.github.com
+          git add v26-update-result/update-status.json
+          git commit -m 'qa: publish V2.6 update rollback status' || true
+          git push origin HEAD:bee-v26-runtime-qa-20261031
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-v26-update-rollback-evidence
+          path: |
+            /tmp/update-success.json
+            /tmp/update-activation.txt
+            /tmp/update-hashes.txt
+            /tmp/forced.txt
+            /tmp/forced-error.txt
+            /tmp/rollback-assert.txt
+            /tmp/v25-state.json
+          if-no-files-found: warn
+          retention-days: 7
