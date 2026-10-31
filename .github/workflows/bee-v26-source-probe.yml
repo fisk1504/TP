@@ -1,0 +1,33 @@
+name: BEE V2.6 source probe
+
+on:
+  push:
+    branches: ["bee-v26-runtime-qa-20261031"]
+    paths:
+      - ".github/workflows/bee-v26-source-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode and verify sanitized source
+        run: |
+          set -euo pipefail
+          cat v26-runtime/*.b64 | tr -d '\r\n' | base64 -di > /tmp/source.tar.gz
+          gzip -t /tmp/source.tar.gz
+          tar -tzf /tmp/source.tar.gz > /tmp/files.txt
+          mkdir app
+          tar -xzf /tmp/source.tar.gz -C app
+          test -f app/release.json
+          test -f app/composer.json
+          test -f app/composer.lock
+          test ! -f app/.env
+          test ! -f app/INSTALL-CODE.txt
+          php -r '$r=json_decode(file_get_contents("app/release.json"),true); echo json_encode($r,JSON_UNESCAPED_SLASHES),"\n"; if(($r["version"]??null)!=="2.6.0") exit(1);'
+          sha256sum /tmp/source.tar.gz
+          wc -l /tmp/files.txt
