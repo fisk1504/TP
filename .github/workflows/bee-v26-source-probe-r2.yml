@@ -1,0 +1,33 @@
+name: BEE V2.6 source probe r2
+
+on:
+  push:
+    branches: ["bee-v26-runtime-qa-20261031"]
+    paths:
+      - "v26-runtime-r2/**"
+      - ".github/workflows/bee-v26-source-probe-r2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact sanitized source
+        run: |
+          set -euo pipefail
+          cat v26-runtime-r2/*.b64 | tr -d '\r\n' | base64 -d > /tmp/source.tar.gz
+          echo '41df29392f8b994ebe7f49f129bc5110f509ef8721bfcac6807a5f66beddca5f  /tmp/source.tar.gz' | sha256sum -c -
+          gzip -t /tmp/source.tar.gz
+          tar -tzf /tmp/source.tar.gz > /tmp/files.txt
+          mkdir app
+          tar -xzf /tmp/source.tar.gz -C app
+          test -f app/release.json
+          test -f app/composer.json
+          test ! -f app/.env
+          test ! -f app/INSTALL-CODE.txt
+          php -r '$r=json_decode(file_get_contents("app/release.json"),true); if(($r["version"]??null)!=="2.6.0") exit(1); echo "release=2.6.0\n";'
+          echo "files=$(wc -l < /tmp/files.txt)"
