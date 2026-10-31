@@ -62,8 +62,10 @@ jobs:
           tar -xzf /tmp/source.tar.gz -C app
           test -f app/release.json
           test -f app/composer.json
+          test -f app/composer.lock
           test ! -f app/.env
           test ! -f app/INSTALL-CODE.txt
+          echo 'b69c2fa1196d301f8af8d3d3a31264c437b07dcaab554f90badd2b5704088bab  app/composer.lock' | sha256sum -c -
           php -r '$r=json_decode(file_get_contents("app/release.json"),true); if(($r["version"]??null)!=="2.6.0") exit(1); echo "release=2.6.0\n";'
           mkdir -p app/storage/app/private app/storage/framework/cache app/storage/framework/sessions app/storage/framework/views app/storage/logs app/bootstrap/cache
           chmod -R u+rwX app/storage app/bootstrap/cache
@@ -81,11 +83,17 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
-          unzip -q ../deps/BEE-V2.3-DEPENDENCIES.zip -d .
-          test -f composer.lock
-          test -f vendor/autoload.php
+          rm -rf /tmp/proddeps && mkdir -p /tmp/proddeps
+          unzip -q ../deps/BEE-V2.3-DEPENDENCIES.zip -d /tmp/proddeps
+          test -d /tmp/proddeps/vendor
+          test -f /tmp/proddeps/vendor/autoload.php
+          rm -rf vendor
+          cp -a /tmp/proddeps/vendor ./vendor
+          echo 'b69c2fa1196d301f8af8d3d3a31264c437b07dcaab554f90badd2b5704088bab  composer.lock' | sha256sum -c -
           composer check-platform-reqs --no-dev
-          php artisan --version
+          php -r 'require "vendor/autoload.php"; echo "autoload=PASS\n";'
+          php artisan --version | tee /tmp/artisan-version.txt
+          grep -q '13.39.0' /tmp/artisan-version.txt
 
       - name: Execute real installer against MySQL 8.4
         working-directory: app
@@ -210,7 +218,7 @@ jobs:
         if: always()
         run: |
           mkdir -p /tmp/evidence
-          for f in /tmp/install-result.json /tmp/db-assertions.json /tmp/mfa.json /tmp/access.json /tmp/analytics.json /tmp/a-valid.json /tmp/a-dup.json /tmp/monitor.json /tmp/alerts.txt /tmp/up.json /tmp/install-body.txt /tmp/http.log; do test -f "$f" && cp "$f" /tmp/evidence/ || true; done
+          for f in /tmp/install-result.json /tmp/db-assertions.json /tmp/mfa.json /tmp/access.json /tmp/analytics.json /tmp/a-valid.json /tmp/a-dup.json /tmp/monitor.json /tmp/alerts.txt /tmp/up.json /tmp/install-body.txt /tmp/http.log /tmp/artisan-version.txt; do test -f "$f" && cp "$f" /tmp/evidence/ || true; done
           php -r '$r=["release"=>"2.6.0","schema"=>4,"php"=>PHP_VERSION,"mysql_runtime"=>true,"source_sha256"=>"41df29392f8b994ebe7f49f129bc5110f509ef8721bfcac6807a5f66beddca5f","generated_at"=>gmdate("c")];file_put_contents("/tmp/evidence/runtime-summary.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
           sha256sum /tmp/evidence/* >/tmp/evidence/SHA256SUMS.txt || true
 
