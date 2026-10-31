@@ -1,0 +1,128 @@
+name: BEE V2.6 live tenant inventory
+
+on:
+  push:
+    branches: ["bee-v26-runtime-qa-20261031"]
+    paths:
+      - ".github/workflows/bee-v26-live-inventory.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture public LIVE inventory read-only
+        run: |
+          set -euo pipefail
+          mkdir -p v26-live-inventory
+          cat > /tmp/inventory.py <<'PY'
+          import concurrent.futures, hashlib, json, re, ssl, sys, time
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlparse
+          from urllib.request import Request, urlopen
+          import xml.etree.ElementTree as ET
+
+          UA='BEE-V2.6-ReadOnly-Inventory/1.0'
+          CTX=ssl.create_default_context()
+          def fetch(url, timeout=18):
+              req=Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
+              try:
+                  with urlopen(req,timeout=timeout,context=CTX) as r:
+                      body=r.read(4_000_000)
+                      return {'url':url,'status':int(r.status),'final_url':r.geturl(),'content_type':r.headers.get('Content-Type',''),'last_modified':r.headers.get('Last-Modified'),'sha256':hashlib.sha256(body).hexdigest(),'body':body}
+              except Exception as e:
+                  code=getattr(e,'code',0) or 0
+                  body=b''
+                  try: body=e.read(1_000_000)
+                  except Exception: pass
+                  return {'url':url,'status':int(code),'final_url':url,'content_type':'','last_modified':None,'sha256':hashlib.sha256(body).hexdigest() if body else None,'body':body,'error':f'{type(e).__name__}: {e}'}
+
+          def sitemap_urls(body):
+              try: root=ET.fromstring(body)
+              except Exception: return [],[]
+              locs=[]
+              for e in root.iter():
+                  if e.tag.endswith('loc') and e.text: locs.append(e.text.strip())
+              tag=root.tag.lower()
+              if 'sitemapindex' in tag: return [],locs
+              return locs,[]
+
+          class P(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.canonical=None; self.robots=None; self.title=''; self.h1=''; self._t=False; self._h=False
+              def handle_starttag(self,tag,attrs):
+                  a={k.lower():(v or '') for k,v in attrs}; t=tag.lower()
+                  if t=='link' and 'canonical' in a.get('rel','').lower(): self.canonical=a.get('href')
+                  if t=='meta' and a.get('name','').lower()=='robots': self.robots=a.get('content')
+                  if t=='title': self._t=True
+                  if t=='h1' and not self.h1: self._h=True
+              def handle_endtag(self,tag):
+                  if tag.lower()=='title': self._t=False
+                  if tag.lower()=='h1': self._h=False
+              def handle_data(self,data):
+                  if self._t: self.title += data
+                  if self._h: self.h1 += data
+          def page_meta(item):
+              out={k:v for k,v in item.items() if k!='body'}
+              if item.get('body') and 'html' in item.get('content_type','').lower():
+                  try:
+                      p=P(); p.feed(item['body'].decode('utf-8','replace'))
+                      out.update({'canonical':p.canonical,'robots_meta':p.robots,'title':' '.join(p.title.split())[:500],'h1':' '.join(p.h1.split())[:500]})
+                  except Exception as e: out['parse_error']=str(e)
+              return out
+
+          def inventory(base):
+              base=base.rstrip('/')
+              root=fetch(base+'/')
+              robots=fetch(base+'/robots.txt')
+              sm0=fetch(base+'/sitemap.xml')
+              pages,children=sitemap_urls(sm0['body']) if sm0.get('body') else ([],[])
+              sitemaps=[{k:v for k,v in sm0.items() if k!='body'}]
+              for child in children:
+                  x=fetch(child); p,c=sitemap_urls(x['body']) if x.get('body') else ([],[]); pages.extend(p); sitemaps.append({k:v for k,v in x.items() if k!='body'})
+                  for grand in c:
+                      y=fetch(grand); pp,_=sitemap_urls(y['body']) if y.get('body') else ([],[]); pages.extend(pp); sitemaps.append({k:v for k,v in y.items() if k!='body'})
+              pages=sorted(set(pages))
+              with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+                  metas=list(ex.map(lambda u: page_meta(fetch(u)), pages))
+              manifests={}
+              for path in ['/bee/site.json','/bee/pages.json','/bee/connection.json','/bee/health.json']:
+                  x=fetch(base+path); clean={k:v for k,v in x.items() if k!='body'}
+                  if x.get('body') and x.get('status')==200:
+                      try:
+                          j=json.loads(x['body']); clean['json_summary']={'type':type(j).__name__,'keys':sorted(j.keys()) if isinstance(j,dict) else None,'count':len(j) if isinstance(j,(dict,list)) else None}
+                      except Exception: pass
+                  manifests[path]=clean
+              errors=[m for m in metas if m.get('status')!=200]
+              canonical_missing=[m['url'] for m in metas if m.get('status')==200 and not m.get('canonical')]
+              return {
+                  'base':base,'captured_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                  'root':page_meta(root),'robots':{k:v for k,v in robots.items() if k!='body'},'sitemaps':sitemaps,
+                  'url_count':len(pages),'urls':pages,'pages':metas,'non_200_count':len(errors),'canonical_missing_count':len(canonical_missing),
+                  'manifests':manifests
+              }
+
+          targets={'cooper':'https://cooperfibra.busqueencontreempresas.com.br','disk':'https://diskbaterias-ia.busqueencontreempresas.com.br'}
+          summary={}
+          for name,base in targets.items():
+              data=inventory(base)
+              json.dump(data,open(f'v26-live-inventory/{name}.json','w'),indent=2,ensure_ascii=False,sort_keys=True)
+              summary[name]={'root_status':data['root']['status'],'robots_status':data['robots']['status'],'url_count':data['url_count'],'non_200_count':data['non_200_count'],'canonical_missing_count':data['canonical_missing_count'],'sitemap_statuses':[x['status'] for x in data['sitemaps']]}
+          summary['all_reachable']=all(v['root_status']==200 and v['robots_status']==200 and all(s==200 for s in v['sitemap_statuses']) for v in summary.values() if isinstance(v,dict))
+          json.dump(summary,open('v26-live-inventory/summary.json','w'),indent=2,sort_keys=True)
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+          python3 /tmp/inventory.py
+      - name: Commit sanitized public inventory
+        if: always()
+        run: |
+          git config user.name 'bee-qa-bot'
+          git config user.email 'bee-qa-bot@users.noreply.github.com'
+          git add v26-live-inventory/*.json || true
+          git commit -m 'qa: publish V2.6 read-only live inventory' || true
+          git push origin HEAD:bee-v26-runtime-qa-20261031
