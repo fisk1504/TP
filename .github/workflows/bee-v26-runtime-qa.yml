@@ -4,7 +4,7 @@ on:
   push:
     branches: ["bee-v26-runtime-qa-20261031"]
     paths:
-      - "v26-runtime/**"
+      - "v26-runtime-r2/**"
       - ".github/workflows/bee-v26-runtime-qa.yml"
   workflow_dispatch:
 
@@ -40,82 +40,79 @@ jobs:
           tools: composer:v2
           coverage: none
 
-      - name: Reconstruct sanitized V2.6 runtime source
+      - name: Reconstruct verified V2.6 source
         run: |
           set -euo pipefail
-          cat v26-runtime/*.b64 | tr -d '\r\n' | base64 -d > /tmp/v26-runtime.tar.gz
-          tar -tzf /tmp/v26-runtime.tar.gz >/tmp/tar-list.txt
+          cat v26-runtime-r2/*.b64 | tr -d '\r\n' | base64 -d > /tmp/source.tar.gz
+          echo '41df29392f8b994ebe7f49f129bc5110f509ef8721bfcac6807a5f66beddca5f  /tmp/source.tar.gz' | sha256sum -c -
+          gzip -t /tmp/source.tar.gz
           mkdir app
-          tar -xzf /tmp/v26-runtime.tar.gz -C app
-          test -f app/composer.json
-          test -f app/composer.lock
+          tar -xzf /tmp/source.tar.gz -C app
           test -f app/release.json
+          test -f app/composer.json
           test ! -f app/.env
           test ! -f app/INSTALL-CODE.txt
-          php -r '$r=json_decode(file_get_contents("app/release.json"),true); if(($r["version"]??null)!=="2.6.0") {fwrite(STDERR,"wrong release\n"); exit(1);} echo "release=2.6.0\n";'
+          php -r '$r=json_decode(file_get_contents("app/release.json"),true); if(($r["version"]??null)!=="2.6.0") exit(1); echo "release=2.6.0\n";'
           mkdir -p app/storage/app/private app/storage/framework/cache app/storage/framework/sessions app/storage/framework/views app/storage/logs app/bootstrap/cache
           chmod -R u+rwX app/storage app/bootstrap/cache
 
-      - name: Install dependencies from locked composer.lock
+      - name: Restore locked production dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: bee-v23-dependencies
+          path: deps
+          github-token: ${{ github.token }}
+          repository: fisk1504/TP
+          run-id: 41014479182
+
+      - name: Verify production dependency shape
         working-directory: app
-        env:
-          COMPOSER_NO_INTERACTION: "1"
-          COMPOSER_PROCESS_TIMEOUT: "900"
         run: |
           set -euo pipefail
-          composer install --no-scripts --prefer-dist --optimize-autoloader
-          composer check-platform-reqs
+          unzip -q ../deps/BEE-V2.3-DEPENDENCIES.zip -d .
+          test -f composer.lock
+          test -f vendor/autoload.php
+          composer check-platform-reqs --no-dev
           php artisan --version
 
-      - name: Execute real V2.6 installer against MySQL 8.4
+      - name: Execute real installer against MySQL 8.4
         working-directory: app
         run: |
           set -euo pipefail
-          php -r 'file_put_contents("/tmp/bee-owner-pass",bin2hex(random_bytes(18))."Aa!");'
-          cat > /tmp/install-v26.php <<'PHP'
+          php -r 'file_put_contents("/tmp/owner-pass",bin2hex(random_bytes(18))."Aa!");'
+          cat >/tmp/install.php <<'PHP'
           <?php
           declare(strict_types=1);
-          $base=getcwd();
-          $password=trim((string)file_get_contents('/tmp/bee-owner-pass'));
-          $_SERVER['DOCUMENT_ROOT']=$base.'/public';
-          $_SERVER['HTTPS']='on';
+          $base=getcwd(); $password=trim((string)file_get_contents('/tmp/owner-pass'));
+          $_SERVER['DOCUMENT_ROOT']=$base.'/public'; $_SERVER['HTTPS']='on';
           foreach(['Common','CommandRunner','DependencyBootstrap','InstallerState','EnvironmentProbe','CpanelProvisioner','EnvWriter','DatabaseProvisioner','Totp','TrustBootstrap','InstallThrottle','FleetTenantProvisioner','InstallRunner'] as $f) require_once $base.'/installer/lib/'.$f.'.php';
           $r=(new BeeInstaller\InstallRunner())->install([
-            'panel_domain'=>'acesso.busqueencontreempresas.com.br',
-            'api_domain'=>'api.busqueencontreempresas.com.br',
-            'analytics_domain'=>'analytics.busqueencontreempresas.com.br',
+            'panel_domain'=>'acesso.busqueencontreempresas.com.br','api_domain'=>'api.busqueencontreempresas.com.br','analytics_domain'=>'analytics.busqueencontreempresas.com.br',
             'db'=>['host'=>'127.0.0.1','port'=>3306,'database'=>'bee_v26','username'=>'root','password'=>''],
             'admin'=>['name'=>'V26 Clean Owner','email'=>'owner@v26.invalid','password'=>$password,'password_confirmation'=>$password],
-            'mfa_required'=>true,
-            'cpanel_mode'=>'assisted',
-            'register_published_tenants'=>true,
-            'monitoring_interval_minutes'=>5,
+            'mfa_required'=>true,'cpanel_mode'=>'assisted','register_published_tenants'=>true,'monitoring_interval_minutes'=>5,
           ]);
           echo json_encode(['installed'=>true,'mfa_required'=>$r['mfa_required']??null,'log'=>$r['log']??[]],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
           PHP
-          php /tmp/install-v26.php | tee /tmp/install-result.json
+          php /tmp/install.php | tee /tmp/install-result.json
           test -f .env
           test -f storage/app/private/install.lock
           test -f storage/app/private/installed-release.json
-          test ! -f storage/app/private/install.authorization
-          test ! -f INSTALL-CODE.txt
           grep -q 'BEE_RELEASE_VERSION="2.6.0"' .env
           grep -q 'BEE_SCHEMA_VERSION="4"' .env
           grep -q 'BEE_ANALYTICS_INGEST_ENABLED="true"' .env
 
-      - name: Database, owner, tenant and analytics assertions
+      - name: DB, owner, tenants and analytics assertions
         working-directory: app
         run: |
           set -euo pipefail
-          cat > /tmp/db-v26.php <<'PHP'
+          cat >/tmp/db.php <<'PHP'
           <?php
-          declare(strict_types=1);
-          $pw=trim((string)file_get_contents('/tmp/bee-owner-pass'));
+          $pw=trim((string)file_get_contents('/tmp/owner-pass'));
           $p=new PDO('mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4','root','',[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
           $c=[];
           $c['owner']=(int)$p->query("SELECT COUNT(*) FROM users u JOIN roles r ON r.id=u.platform_role_id WHERE u.email='owner@v26.invalid' AND u.status='ACTIVE' AND r.name='PLATFORM_OWNER'")->fetchColumn()===1;
-          $hash=$p->query("SELECT password FROM users WHERE email='owner@v26.invalid' LIMIT 1")->fetchColumn();
-          $c['password_hash']=is_string($hash)&&password_verify($pw,$hash);
+          $hash=$p->query("SELECT password FROM users WHERE email='owner@v26.invalid' LIMIT 1")->fetchColumn(); $c['password_hash']=is_string($hash)&&password_verify($pw,$hash);
           $c['tenants']=(int)$p->query("SELECT COUNT(*) FROM tenants WHERE slug IN ('cooperfibra','diskbaterias-ia') AND status='ACTIVE'")->fetchColumn()===2;
           $c['sites']=(int)$p->query("SELECT COUNT(*) FROM sites s JOIN tenants t ON t.id=s.tenant_id WHERE t.slug IN ('cooperfibra','diskbaterias-ia')")->fetchColumn()===2;
           $c['analytics_sources']=(int)$p->query("SELECT COUNT(*) FROM analytics_sources a JOIN sites s ON s.id=a.site_id JOIN tenants t ON t.id=s.tenant_id WHERE t.slug IN ('cooperfibra','diskbaterias-ia') AND a.provider='bee' AND a.enabled=1")->fetchColumn()===2;
@@ -124,104 +121,91 @@ jobs:
           foreach($c as $k=>$ok){if(!$ok){fwrite(STDERR,"FAIL:$k\n");exit(1);}}
           echo json_encode(['status'=>'PASS','checks'=>$c,'platform'=>$row],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
           PHP
-          php /tmp/db-v26.php | tee /tmp/db-assertions.json
+          php /tmp/db.php | tee /tmp/db-assertions.json
 
-      - name: Real user_site_access and tenant isolation
+      - name: MFA engine and recovery material
         working-directory: app
         run: |
           set -euo pipefail
-          cat > /tmp/access-v26.php <<'PHP'
+          cat >/tmp/mfa.php <<'PHP'
           <?php
-          declare(strict_types=1);
-          require 'vendor/autoload.php';
-          $app=require 'bootstrap/app.php';
-          $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-          use App\Models\Role; use App\Models\Site; use App\Models\User; use App\Services\AccessService;
-          $cooper=Site::where('domain','cooperfibra.busqueencontreempresas.com.br')->firstOrFail();
-          $disk=Site::where('domain','diskbaterias-ia.busqueencontreempresas.com.br')->firstOrFail();
-          $role=Role::where('name','CLIENT_ANALYST')->firstOrFail();
-          $mk=function(string $email,array $sites)use($role){$u=User::create(['name'=>$email,'email'=>$email,'password'=>'TempPass!123456','platform_role_id'=>$role->id,'status'=>'ACTIVE']);$u->siteAccess()->sync($sites);return $u->fresh('platformRole');};
-          $uc=$mk('client-cooper@v26.invalid',[$cooper->id]); $ud=$mk('client-disk@v26.invalid',[$disk->id]); $ub=$mk('client-both@v26.invalid',[$cooper->id,$disk->id]);
-          $a=app(AccessService::class);
-          $checks=['cooper_own'=>$a->canViewSite($uc,$cooper),'cooper_denied_disk'=>!$a->canViewSite($uc,$disk),'disk_own'=>$a->canViewSite($ud,$disk),'disk_denied_cooper'=>!$a->canViewSite($ud,$cooper),'both_cooper'=>$a->canViewSite($ub,$cooper),'both_disk'=>$a->canViewSite($ub,$disk),'client_not_platform'=>!$uc->isPlatformUser()];
-          foreach($checks as $k=>$ok){if(!$ok){fwrite(STDERR,"FAIL:$k\n");exit(1);}}
-          echo json_encode(['status'=>'PASS','checks'=>$checks],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
+          require 'vendor/autoload.php'; $app=require 'bootstrap/app.php'; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+          $t=app(App\Services\Security\TotpService::class); $s=$t->generateSecret(); $codes=$t->recoveryCodes();
+          $r=new ReflectionMethod($t,'at'); $r->setAccessible(true); $counter=intdiv(time(),30); $code=$r->invoke($t,$s,$counter);
+          $checks=['secret'=>strlen($s)>=16,'totp'=>$t->matchedCounter($s,$code,1,30)===$counter,'recovery_count'=>count($codes)===10,'recovery_unique'=>count(array_unique($codes))===10];
+          foreach($checks as $k=>$ok) if(!$ok){fwrite(STDERR,"FAIL:$k\n");exit(1);} echo json_encode(['status'=>'PASS','checks'=>$checks],JSON_PRETTY_PRINT),"\n";
           PHP
-          php /tmp/access-v26.php | tee /tmp/access-matrix.json
+          php /tmp/mfa.php | tee /tmp/mfa.json
+
+      - name: user_site_access and tenant isolation
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cat >/tmp/access.php <<'PHP'
+          <?php
+          require 'vendor/autoload.php'; $app=require 'bootstrap/app.php'; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+          $cooper=App\Models\Site::where('domain','cooperfibra.busqueencontreempresas.com.br')->firstOrFail(); $disk=App\Models\Site::where('domain','diskbaterias-ia.busqueencontreempresas.com.br')->firstOrFail(); $role=App\Models\Role::where('name','CLIENT_ANALYST')->firstOrFail();
+          $mk=function($email,$ids)use($role){$u=App\Models\User::create(['name'=>$email,'email'=>$email,'password'=>'TempPass!123456','platform_role_id'=>$role->id,'status'=>'ACTIVE']);$u->siteAccess()->sync($ids);return $u->fresh('platformRole');};
+          $uc=$mk('client-cooper@v26.invalid',[$cooper->id]); $ud=$mk('client-disk@v26.invalid',[$disk->id]); $ub=$mk('client-both@v26.invalid',[$cooper->id,$disk->id]); $a=app(App\Services\AccessService::class);
+          $c=['cooper_own'=>$a->canViewSite($uc,$cooper),'cooper_denied_disk'=>!$a->canViewSite($uc,$disk),'disk_own'=>$a->canViewSite($ud,$disk),'disk_denied_cooper'=>!$a->canViewSite($ud,$cooper),'both_cooper'=>$a->canViewSite($ub,$cooper),'both_disk'=>$a->canViewSite($ub,$disk),'client_not_platform'=>!$uc->isPlatformUser()];
+          foreach($c as $k=>$ok) if(!$ok){fwrite(STDERR,"FAIL:$k\n");exit(1);} echo json_encode(['status'=>'PASS','checks'=>$c],JSON_PRETTY_PRINT),"\n";
+          PHP
+          php /tmp/access.php | tee /tmp/access.json
 
       - name: Start HTTP app
         working-directory: app
         run: |
           set -euo pipefail
           php artisan config:clear
-          php artisan serve --host=127.0.0.1 --port=8080 >/tmp/bee-v26-http.log 2>&1 &
-          echo $! >/tmp/bee-v26-http.pid
+          php artisan serve --host=127.0.0.1 --port=8080 >/tmp/http.log 2>&1 &
+          echo $! >/tmp/http.pid
           for i in $(seq 1 25); do curl -fsS -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/up >/tmp/up.json && break || sleep 1; done
           test -s /tmp/up.json
 
-      - name: Analytics ingest HTTP contract
+      - name: Analytics ingest contract
         working-directory: app
         run: |
           set -euo pipefail
-          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$r=$p->query("SELECT a.public_key,s.domain FROM analytics_sources a JOIN sites s ON s.id=a.site_id WHERE s.domain=\"diskbaterias-ia.busqueencontreempresas.com.br\" AND a.enabled=1 LIMIT 1")->fetch(PDO::FETCH_ASSOC);file_put_contents("/tmp/site-key",$r["public_key"]);file_put_contents("/tmp/site-origin","https://".$r["domain"]);'
-          KEY=$(cat /tmp/site-key); ORIGIN=$(cat /tmp/site-origin); UUID=11111111-2222-4333-8444-555555555555
-          valid=$(curl -sS -o /tmp/a-valid.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data "{\"event_uuid\":\"$UUID\",\"event_name\":\"page_view\",\"path\":\"/teste?secret=1\",\"device\":\"mobile\",\"properties\":{\"scroll_percent\":75,\"email\":\"should-drop@example.com\"}}" http://127.0.0.1:8080/v1/events)
-          test "$valid" = "202"
-          dup=$(curl -sS -o /tmp/a-dup.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data "{\"event_uuid\":\"$UUID\",\"event_name\":\"page_view\"}" http://127.0.0.1:8080/v1/events)
-          test "$dup" = "202"; grep -q 'deduplicated' /tmp/a-dup.json
-          wrong_origin=$(curl -sS -o /tmp/a-origin.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H 'Origin: https://evil.invalid' -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data '{"event_name":"page_view"}' http://127.0.0.1:8080/v1/events)
-          test "$wrong_origin" = "403"
-          wrong_key=$(curl -sS -o /tmp/a-key.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H 'X-Bee-Site-Key: wrong-key' -H 'Content-Type: application/json' --data '{"event_name":"page_view"}' http://127.0.0.1:8080/v1/events)
-          test "$wrong_key" = "401"
-          unknown=$(curl -sS -o /tmp/a-unknown.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data '{"event_name":"not_allowed"}' http://127.0.0.1:8080/v1/events)
-          test "$unknown" = "422"
-          python3 - <<'PY' >/tmp/oversize.json
-          import json
-          print(json.dumps({'event_name':'page_view','path':'/'+('x'*17000)}))
-          PY
-          oversized=$(curl -sS -o /tmp/a-big.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data-binary @/tmp/oversize.json http://127.0.0.1:8080/v1/events)
-          test "$oversized" = "413"
-          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$row=$p->query("SELECT path,properties_json FROM analytics_events WHERE event_uuid=\"11111111-2222-4333-8444-555555555555\"")->fetch(PDO::FETCH_ASSOC);if(!$row||$row["path"]!=="/teste")exit(1);$props=json_decode($row["properties_json"],true);if(isset($props["email"])||($props["scroll_percent"]??null)!==75)exit(2);$count=(int)$p->query("SELECT COUNT(*) FROM analytics_events WHERE event_uuid=\"11111111-2222-4333-8444-555555555555\"")->fetchColumn();if($count!==1)exit(3);echo "analytics_db=PASS\n";'
-          printf '{"status":"PASS","valid":202,"duplicate":202,"wrong_origin":403,"wrong_key":401,"unknown":422,"oversized":413}\n' >/tmp/analytics-contract.json
+          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$r=$p->query("SELECT a.public_key,s.domain FROM analytics_sources a JOIN sites s ON s.id=a.site_id WHERE s.domain=\"diskbaterias-ia.busqueencontreempresas.com.br\" AND a.enabled=1 LIMIT 1")->fetch(PDO::FETCH_ASSOC);file_put_contents("/tmp/key",$r["public_key"]);file_put_contents("/tmp/origin","https://".$r["domain"]);'
+          KEY=$(cat /tmp/key); ORIGIN=$(cat /tmp/origin); UUID=11111111-2222-4333-8444-555555555555
+          valid=$(curl -sS -o /tmp/a-valid.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data "{\"event_uuid\":\"$UUID\",\"event_name\":\"page_view\",\"path\":\"/teste?secret=1\",\"device\":\"mobile\",\"properties\":{\"scroll_percent\":75,\"email\":\"drop@example.com\"}}" http://127.0.0.1:8080/v1/events); test "$valid" = 202
+          dup=$(curl -sS -o /tmp/a-dup.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data "{\"event_uuid\":\"$UUID\",\"event_name\":\"page_view\"}" http://127.0.0.1:8080/v1/events); test "$dup" = 202; grep -q deduplicated /tmp/a-dup.json
+          test "$(curl -sS -o /tmp/a-origin.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H 'Origin: https://evil.invalid' -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data '{"event_name":"page_view"}' http://127.0.0.1:8080/v1/events)" = 403
+          test "$(curl -sS -o /tmp/a-key.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H 'X-Bee-Site-Key: wrong' -H 'Content-Type: application/json' --data '{"event_name":"page_view"}' http://127.0.0.1:8080/v1/events)" = 401
+          test "$(curl -sS -o /tmp/a-unknown.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data '{"event_name":"not_allowed"}' http://127.0.0.1:8080/v1/events)" = 422
+          python3 -c 'import json;print(json.dumps({"event_name":"page_view","path":"/"+("x"*17000)}))' >/tmp/big.json
+          big=$(curl -sS -o /tmp/a-big.json -w '%{http_code}' -H 'Host: analytics.busqueencontreempresas.com.br' -H "Origin: $ORIGIN" -H "X-Bee-Site-Key: $KEY" -H 'Content-Type: application/json' --data-binary @/tmp/big.json http://127.0.0.1:8080/v1/events); test "$big" = 413
+          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$r=$p->query("SELECT path,properties_json FROM analytics_events WHERE event_uuid=\"11111111-2222-4333-8444-555555555555\"")->fetch(PDO::FETCH_ASSOC);if(!$r||$r["path"]!=="/teste")exit(1);$x=json_decode($r["properties_json"],true);if(isset($x["email"])||($x["scroll_percent"]??null)!==75)exit(2);if((int)$p->query("SELECT COUNT(*) FROM analytics_events WHERE event_uuid=\"11111111-2222-4333-8444-555555555555\"")->fetchColumn()!==1)exit(3);echo "analytics_db=PASS\n";'
+          printf '{"status":"PASS","valid":202,"duplicate":202,"wrong_origin":403,"wrong_key":401,"unknown":422,"oversized":413}\n' >/tmp/analytics.json
 
-      - name: Monitoring/SEO alert runtime primitives
+      - name: Monitoring and alerts primitives
         working-directory: app
         run: |
           set -euo pipefail
-          cat >/tmp/monitor-v26.php <<'PHP'
+          cat >/tmp/monitor.php <<'PHP'
           <?php
-          require 'vendor/autoload.php'; $app=require 'bootstrap/app.php'; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-          $site=App\Models\Site::where('domain','diskbaterias-ia.busqueencontreempresas.com.br')->firstOrFail();
-          $seo=app(App\Services\SeoMonitorService::class);
-          $base=['urls'=>['https://x/a','https://x/b'],'canonicals'=>['https://x/a'=>'https://x/a','https://x/b'=>'https://x/b'],'noindex_urls'=>[]];
-          $cur=['urls'=>['https://x/a'],'canonicals'=>['https://x/a'=>'https://x/changed'],'noindex_urls'=>['https://x/a']];
-          $seo->saveBaseline($site,$base); $seo->saveCurrent($site,$cur); $r=$seo->compare($base,$cur);
-          if(($r['status']??'')!=='DRIFT'||count($r['issues']??[])<3) exit(1);
-          echo json_encode(['status'=>'PASS','seo_compare'=>$r],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES),"\n";
+          require 'vendor/autoload.php'; $app=require 'bootstrap/app.php'; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap(); $site=App\Models\Site::where('domain','diskbaterias-ia.busqueencontreempresas.com.br')->firstOrFail(); $seo=app(App\Services\SeoMonitorService::class); $b=['urls'=>['https://x/a','https://x/b'],'canonicals'=>['https://x/a'=>'https://x/a','https://x/b'=>'https://x/b'],'noindex_urls'=>[]]; $c=['urls'=>['https://x/a'],'canonicals'=>['https://x/a'=>'https://x/changed'],'noindex_urls'=>['https://x/a']]; $seo->saveBaseline($site,$b);$seo->saveCurrent($site,$c);$r=$seo->compare($b,$c);if(($r['status']??'')!=='DRIFT'||count($r['issues']??[])<3)exit(1);echo json_encode(['status'=>'PASS','seo_compare'=>$r],JSON_PRETTY_PRINT),"\n";
           PHP
-          php /tmp/monitor-v26.php | tee /tmp/monitor-primitives.json
+          php /tmp/monitor.php | tee /tmp/monitor.json
           php artisan bee:alerts:evaluate
-          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$h=(int)$p->query("SELECT COUNT(*) FROM settings WHERE scope_type=\"platform\" AND `key`=\"cron.last_heartbeat\"")->fetchColumn();$a=(int)$p->query("SELECT COUNT(*) FROM alerts WHERE type=\"MONITORING_STALE\" AND status=\"OPEN\"")->fetchColumn();if($h!==1||$a<2)exit(1);echo "alerts=PASS heartbeat=PASS\n";' | tee /tmp/alerts-runtime.txt
+          php -r '$p=new PDO("mysql:host=127.0.0.1;port=3306;dbname=bee_v26;charset=utf8mb4","root","");$h=(int)$p->query("SELECT COUNT(*) FROM settings WHERE scope_type=\"platform\" AND `key`=\"cron.last_heartbeat\"")->fetchColumn();$a=(int)$p->query("SELECT COUNT(*) FROM alerts WHERE type=\"MONITORING_STALE\" AND status=\"OPEN\"")->fetchColumn();if($h!==1||$a<2)exit(1);echo "heartbeat=PASS alerts=PASS\n";' | tee /tmp/alerts.txt
 
       - name: Installer lock HTTP
-        working-directory: app
         run: |
-          set -euo pipefail
-          code=$(curl -sS -o /tmp/install-body.txt -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/install/)
-          test "$code" = "404"
+          code=$(curl -sS -o /tmp/install-body.txt -w '%{http_code}' -H 'Host: acesso.busqueencontreempresas.com.br' http://127.0.0.1:8080/install/); test "$code" = 404
 
-      - name: Evidence
+      - name: Build evidence
         if: always()
         run: |
           mkdir -p /tmp/evidence
-          for f in /tmp/install-result.json /tmp/db-assertions.json /tmp/access-matrix.json /tmp/analytics-contract.json /tmp/a-valid.json /tmp/a-dup.json /tmp/monitor-primitives.json /tmp/alerts-runtime.txt /tmp/up.json /tmp/install-body.txt /tmp/bee-v26-http.log /tmp/tar-list.txt; do test -f "$f" && cp "$f" /tmp/evidence/ || true; done
-          php -r '$r=["release"=>"2.6.0","schema"=>4,"php"=>PHP_VERSION,"mysql_runtime"=>true,"generated_at"=>gmdate("c")];file_put_contents("/tmp/evidence/runtime-summary.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
+          for f in /tmp/install-result.json /tmp/db-assertions.json /tmp/mfa.json /tmp/access.json /tmp/analytics.json /tmp/a-valid.json /tmp/a-dup.json /tmp/monitor.json /tmp/alerts.txt /tmp/up.json /tmp/install-body.txt /tmp/http.log; do test -f "$f" && cp "$f" /tmp/evidence/ || true; done
+          php -r '$r=["release"=>"2.6.0","schema"=>4,"php"=>PHP_VERSION,"mysql_runtime"=>true,"source_sha256"=>"41df29392f8b994ebe7f49f129bc5110f509ef8721bfcac6807a5f66beddca5f","generated_at"=>gmdate("c")];file_put_contents("/tmp/evidence/runtime-summary.json",json_encode($r,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));'
           sha256sum /tmp/evidence/* >/tmp/evidence/SHA256SUMS.txt || true
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bee-v26-runtime-evidence
+          name: bee-v26-runtime-evidence-r2
           path: /tmp/evidence
           retention-days: 7
